@@ -48,7 +48,7 @@ class TestDBUpgradeCLI(tests.BaseTest):
 
 class TestDeleteDeallocatedIps(tests.BaseTest):
 
-    def test_deallocated_ips_get_deleted(self):
+    def test_deallocated_ips_get_freed(self):
         block = factory_models.PublicIpBlockFactory()
         ip = factory_models.IpAddressFactory(ip_block_id=block.id)
         block.deallocate_ip(ip.address)
@@ -60,7 +60,10 @@ class TestDeleteDeallocatedIps(tests.BaseTest):
         config_file = tests.test_config_file()
         functional.execute("{0} --config-file={1}".format(script, config_file))
 
-        self.assertIsNone(models.IpAddress.get(ip.id))
+        ip = models.IpAddress.get(ip.id)
+        self.assertFalse(ip.allocated)
+        self.assertIsNone(ip.interface)
+        self.assertIsNone(ip.used_by_tenant_id)
 
     def _push_back_deallocated_date(self, ip, seconds):
         secs_to_subtract = datetime.timedelta(seconds=int(seconds))

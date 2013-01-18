@@ -15,6 +15,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import logging
+
+import netaddr
+
 import sqlalchemy.exc
 from sqlalchemy import and_
 from sqlalchemy import or_
@@ -27,6 +31,9 @@ from melange.common import utils
 from melange.db.sqlalchemy import migration
 from melange.db.sqlalchemy import mappers
 from melange.db.sqlalchemy import session
+
+
+LOG = logging.getLogger(__name__)
 
 
 def list(query_func, *args, **kwargs):
@@ -51,9 +58,10 @@ def find_by(model, **kwargs):
     return _query_by(model, **kwargs).first()
 
 
-def save(model):
+def save(model, db_session=None):
     try:
-        db_session = session.get_session()
+        if not db_session:
+            db_session = session.get_session()
         model = db_session.merge(model)
         db_session.flush()
         return model
@@ -177,13 +185,28 @@ def find_all_ips_in_network(model, network_id=None, **conditions):
         filter(ipam.models.IpBlock.network_id == network_id)
 
 
-def find_all_allocated_ips(model, used_by_device=None, used_by_tenant=None,
-                           **conditions):
+def find_all_addresses(ip_block_id):
+    query = _query_by(ipam.models.IpAddress, ip_block_id=ip_block_id)
+    query = query.filter(or_(ipam.models.IpAddress.allocated,
+                             ipam.models.IpAddress.marked_for_deallocation))
+    return query
+
+
+def find_all_allocated_ips(_model, used_by_device=None,
+                           used_by_tenant=None, address=None,
+                           interface_id=None):
     deallocated_on = None
-    query = _query_by(ipam.models.IpAddress, **conditions).\
-        filter(or_(ipam.models.IpAddress.marked_for_deallocation
-                   == deallocated_on,
-                   ipam.models.IpAddress.marked_for_deallocation is False))
+    query = _query_by(ipam.models.IpAddress)
+    allocated = or_(ipam.models.IpAddress.marked_for_deallocation
+                    == deallocated_on,
+                    ipam.models.IpAddress.marked_for_deallocation is False)
+    query = query.filter(allocated)
+
+    if interface_id is not None:
+        query = query.filter_by(interface_id=interface_id)
+
+    if address is not None:
+        query = query.filter_by(address=address)
 
     if used_by_device or used_by_tenant:
         query = query.join(ipam.models.Interface)
@@ -193,6 +216,106 @@ def find_all_allocated_ips(model, used_by_device=None, used_by_tenant=None,
         query = query.filter(ipam.models.Interface.tenant_id == used_by_tenant)
 
     return query
+
+
+def delete_interface(interface):
+    db_session = session.get_session()
+    with db_session.begin():
+        mac_qry = _query_by(ipam.models.MacAddress, db_session=db_session,
+                            interface_id=interface.id)
+
+        mac = mac_qry.with_lockmode('update').first()
+
+        if mac:
+            db_session.delete(mac)
+
+        ips_qry = _query_by(ipam.models.IpAddress, db_session=db_session,
+                            interface_id=interface.id)
+        ips = ips_qry.with_lockmode('update').all()
+
+        for ip in ips:
+            LOG.debug("Marking IP address for deallocation: %r" % ip)
+            ip.allocated = False
+            ip.marked_for_deallocation = True
+            ip.deallocated_at = utils.utcnow()
+            ip.interface_id = None
+            db_session.merge(ip)
+
+        db_session.delete(interface)
+
+        return mac, ips
+
+    # NOTE(jkoelker) Failsafe return:
+    return None, []
+
+
+def allocate_ipv4_address(ip_block, interface, requested_address=None):
+    model = ipam.models.IpAddress
+
+    db_session = session.get_session()
+    with db_session.begin():
+        address_qry = _query_by(model, db_session=db_session,
+                                allocated=False, ip_block_id=ip_block.id)
+
+        if requested_address is not None:
+            address_qry = address_qry.filter(address=requested_address)
+
+        address = address_qry.with_lockmode('update').first()
+
+        if address:
+            address.allocated = True
+            address.interface_id = interface.id
+            address.used_by_tenant_id = interface.tenant_id
+            address.updated_at = utils.utcnow()
+            db_session.merge(address)
+            return address
+
+        # NOTE(jkoelker) This is here so we can slowly move off the table
+        allocatable_qry = _query_by(ipam.models.AllocatableIp,
+                                    db_session=db_session,
+                                    ip_block_id=ip_block.id)
+        if requested_address is not None:
+            filter_kwargs = {'address': requested_address}
+            allocatable_qry = allocatable_qry.filter(**filter_kwargs)
+
+        address = allocatable_qry.first()
+        if address:
+            ip = address.address
+            db_session.delete(address)
+
+        else:
+            ips = netaddr.IPNetwork(ip_block.cidr)
+            counter = (ip_block.allocatable_ip_counter or ips[0].value)
+
+            if counter > ips[-1].value:
+                ip_block.is_full = True
+                # NOTE(jkoelker) explicit save() to flush the session prior
+                #                to raising
+                save(ip_block, db_session=db_session)
+                raise exception.NoMoreAddressesError(_("IpBlock is full"))
+
+            ip = netaddr.IPAddress(counter)
+
+            # NOTE(jkoelker) HRM, this may need to be rethought order wise
+            counter = counter + 1
+            if counter > ips[-1].value:
+                ip_block.is_full = True
+
+            ip_block.allocatable_ip_counter = counter
+            db_session.merge(ip_block)
+
+        # NOTE(jkoelker) SQLAlchemy models, how do you work? ;)
+        address = model(id=utils.generate_uuid(),
+                        created_at=utils.utcnow(),
+                        updated_at=utils.utcnow(),
+                        address=str(ip),
+                        ip_block_id=ip_block.id,
+                        interface_id=interface.id,
+                        used_by_tenant_id=interface.tenant_id,
+                        allocated=True)
+        db_session.merge(address)
+
+        return address
 
 
 def pop_allocatable_address(address_model, **conditions):

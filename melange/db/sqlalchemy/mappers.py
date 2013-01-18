@@ -38,6 +38,10 @@ def map(engine, models):
     interfaces_table = Table('interfaces', meta, autoload=True)
     allowed_ips_table = Table('allowed_ips', meta, autoload=True)
 
+    # NOTE(jkoelker) This is here so we can slowly move off of the table
+    allocatable_ips_table = Table('allocatable_ips', meta, autoload=True)
+    orm.mapper(models["AllocatableIp"], allocatable_ips_table)
+
     orm.mapper(models["IpBlock"], ip_blocks_table)
     orm.mapper(models["IpAddress"], ip_addresses_table)
     orm.mapper(models["Policy"], policies_table)

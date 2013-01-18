@@ -52,6 +52,7 @@ class IpAddressFactory(factory.Factory):
     ip_block_id = factory.LazyAttribute(lambda a: IpBlockFactory().id)
     interface_id = factory.LazyAttribute(lambda a: InterfaceFactory().id)
     used_by_tenant_id = "tenant_id"
+    allocated = True
 
     @factory.lazy_attribute_sequence
     def address(ip, n):

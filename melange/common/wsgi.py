@@ -149,11 +149,11 @@ class Resource(openstack_wsgi.Resource):
             return result
 
         except exception.MelangeError as melange_error:
-            LOG.debug(traceback.format_exc())
+            LOG.exception("Melange error")
             httpError = self._get_http_error(melange_error)
             return Fault(httpError(str(melange_error), request=request))
         except webob.exc.HTTPError as http_error:
-            LOG.debug(traceback.format_exc())
+            LOG.exception("HTTP error")
             return Fault(http_error)
         except Exception as error:
             LOG.exception(error)

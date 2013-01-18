@@ -24,7 +24,6 @@ import operator
 
 from melange import db
 from melange import ipv6
-from melange import ipv4
 from melange import mac
 from melange.common import config
 from melange.common import exception
@@ -290,7 +289,8 @@ class IpBlock(ModelBase):
 
     @property
     def ips_used(self):
-        allocated_count = IpAddress.find_all(ip_block_id=self.id).count()
+        allocated_count = IpAddress.find_all(ip_block_id=self.id,
+                                             allocated=True).count()
         if self.policy_id:
             reserved = self.policy().size(self.cidr)
         else:
@@ -319,7 +319,6 @@ class IpBlock(ModelBase):
         for block in self.subnets():
             block.delete()
         IpAddress.find_all(ip_block_id=self.id).delete()
-        ipv4.plugin().get_generator(self).delete()
         super(IpBlock, self).delete()
 
     def policy(self):
@@ -331,10 +330,12 @@ class IpBlock(ModelBase):
     def does_address_exists(self, address):
         return (address in [self.broadcast, self.gateway]
                 or IpAddress.get_by(ip_block_id=self.id,
-                                    address=address) is not None)
+                                    address=address,
+                                    allocated=True) is not None)
 
     def addresses(self):
-        return IpAddress.find_all(ip_block_id=self.id).all()
+        # NOTE(jkoelker) needless abstraction is needless
+        return db.db_api.find_all_addresses(self.id).all()
 
     @utils.cached_property
     def parent(self):
@@ -363,43 +364,74 @@ class IpBlock(ModelBase):
         return self._allocate_available_ip(interface, **kwargs)
 
     def _allocate_available_ip(self, interface, **kwargs):
-        max_allowed_retry = int(config.Config.get("ip_allocation_retries", 10))
 
-        for retries in range(max_allowed_retry):
-            address = self._generate_ip(
-                used_by_tenant=interface.tenant_id,
-                mac_address=interface.mac_address_eui_format,
-                **kwargs)
+        def clear_addresses(addresses):
+            for address in addresses:
+                address.update(allocated=False, interface_id=None,
+                               used_by_tenant_id=None)
+                address.save()
+
+        max_allowed_retry = int(config.Config.get("ip_allocation_retries",
+                                                  10))
+
+        tenant_id = interface.tenant_id
+        policy_excluded_addresses = []
+
+        for retries in xrange(max_allowed_retry):
             try:
-                return IpAddress.create(address=address,
-                                        ip_block_id=self.id,
-                                        used_by_tenant_id=interface.tenant_id,
-                                        interface_id=interface.id)
-            except exception.DBConstraintError as error:
-                LOG.debug("IP allocation retry count :{0}".format(retries + 1))
-                LOG.exception(error)
+                if self.is_ipv6():
+                    mac_address = interface.mac_address_eui_format
+                    return self._allocate_ipv6(tenant_id,
+                                               interface.id,
+                                               used_by_tenant=tenant_id,
+                                               mac_address=mac_address,
+                                               **kwargs)
 
-        raise ConcurrentAllocationError(
-            _("Cannot allocate address for block %s at this time") % self.id)
+                address = IpAddress.allocate(ip_block=self,
+                                             interface=interface)
+                if not address:
+                    self.update(is_full=True)
+                    msg = _("IpBlock is full")
+                    raise exception.NoMoreAddressesError(msg)
 
-    def _generate_ip(self, **kwargs):
-        if self.is_ipv6():
-            generator = ipv6.address_generator_factory(self.cidr,
-                                                       **kwargs)
-            address = next((address for address in IpAddressIterator(generator)
-                           if self.does_address_exists(address) is False),
-                           None)
-        else:
-            generator = ipv4.plugin().get_generator(self)
-            address = next((address for address in IpAddressIterator(generator)
-                            if self._address_is_allocatable(self.policy(),
-                                                            address)),
-                           None)
+                # NOTE(jkoelker) policy enforcement is no-bueno ;(
+                if not self._address_is_allocatable(self.policy(),
+                                                    address.address):
+                    policy_excluded_addresses.append(address)
+                    continue
+
+                clear_addresses(policy_excluded_addresses)
+                return address
+
+            except exception.DBConstraintError:
+                count = retries + 1
+                msg = "IP allocation retry count :{0}".format(count)
+                LOG.exception(msg)
+
+        clear_addresses(policy_excluded_addresses)
+        msg = _("Cannot allocate address for block %s at this time")
+        raise ConcurrentAllocationError(msg % self.id)
+
+    def _allocate_ipv6(self, tenant_id, interface_id, **kwargs):
+        factory = ipv6.address_generator_factory
+
+        generator = factory(self.cidr, **kwargs)
+
+        address_iter = (addr for addr in IpAddressIterator(generator)
+                        if self.does_address_exists(addr) is False)
+
+        address = next(address_iter, None)
 
         if not address:
             self.update(is_full=True)
-            raise exception.NoMoreAddressesError(_("IpBlock is full"))
-        return address
+            msg = _("IpBlock is full")
+            raise exception.NoMoreAddressesError(msg)
+
+        return IpAddress.create(address=address,
+                                ip_block_id=self.id,
+                                used_by_tenant_id=tenant_id,
+                                interface_id=interface_id,
+                                allocated=True)
 
     def _allocate_specific_ip(self, interface, address):
 
@@ -414,16 +446,23 @@ class IpBlock(ModelBase):
             raise AddressDisallowedByPolicyError(
                 _("Block policy does not allow this address"))
 
-        return IpAddress.create(address=address,
-                                ip_block_id=self.id,
-                                used_by_tenant_id=interface.tenant_id,
-                                interface_id=interface.id)
+        ip = IpAddress.get_by(ip_block_id=self.id, address=address)
+
+        if ip and (ip.allocated or ip.marked_for_deallocation):
+            raise DuplicateAddressError()
+
+        if self.is_ipv6() or not ip:
+            return IpAddress.create(address=address,
+                                    ip_block_id=self.id,
+                                    used_by_tenant_id=interface.tenant_id,
+                                    interface_id=interface.id,
+                                    allocated=True)
+        return IpAddress.allocate(self, interface, address=address)
 
     def _address_is_allocatable(self, policy, address):
         unavailable_addresses = [self.gateway, self.broadcast]
-        return ((address not in unavailable_addresses
-                 and self._allowed_by_policy(policy, address)) and
-                not self.does_address_exists(address))
+        return (address not in unavailable_addresses
+                and self._allowed_by_policy(policy, address))
 
     def _allowed_by_policy(self, policy, address):
         return policy is None or policy.allows(self.cidr, address)
@@ -447,13 +486,26 @@ class IpBlock(ModelBase):
             LOG.debug("Deallocating IP: %s" % ip_address)
             ip_address.deallocate()
 
+    # TODO(jkoelker) This should probably move into the dbapi so it can
+    #                bulk deallocate
     def delete_deallocated_ips(self, deallocated_by_func):
         for ip in db.db_api.find_deallocated_ips(
                 deallocated_by=deallocated_by_func(), ip_block_id=self.id):
             LOG.debug("Deleting deallocated IP: %s" % ip)
-            generator = ipv4.plugin().get_generator(self)
-            generator.ip_removed(ip.address)
-            ip.delete()
+
+            if self.is_ipv6():
+                ip.delete()
+                continue
+
+            # NOTE(jkoelker) Single table ipv4 deallocation
+            ip.used_by_tenant_id = None
+            ip.allocated = False
+            ip.marked_for_deallocation = False
+            ip.save()
+
+            # NOTE(jkoelker) continue to notify on delete since that
+            #                means deallocated.
+            ip._notify_fields("delete")
 
         self.update(is_full=False)
 
@@ -584,6 +636,11 @@ class IpBlock(ModelBase):
         self.dns2 = self.dns2 or config.Config.get("dns2")
 
 
+# NOTE(jkoelker) This is here so we can slowly move off the table
+class AllocatableIp(ModelBase):
+    pass
+
+
 class IpAddress(ModelBase):
 
     _data_fields = ['ip_block_id', 'address', 'version']
@@ -595,8 +652,10 @@ class IpAddress(ModelBase):
                                      'address']
 
     def _validate(self):
-        self._validate_presence_of("used_by_tenant_id")
-        self._validate_existence_of("interface_id", Interface)
+        if self.allocated:
+            self._validate_presence_of("used_by_tenant_id")
+        if self.interface_id:
+            self._validate_existence_of("interface_id", Interface)
 
     @classmethod
     def _process_conditions(cls, raw_conditions):
@@ -623,10 +682,21 @@ class IpAddress(ModelBase):
         LOG.debug("Retrieving all allocated IPs.")
         return db.db_query.find_all_allocated_ips(cls, **conditions)
 
+    @classmethod
+    def allocate(cls, ip_block, interface, address=None):
+        address = db.db_api.allocate_ipv4_address(ip_block,
+                                                  interface,
+                                                  address)
+        # NOTE(jkoelker) Continue to notify on create since that
+        #                means allocation.
+        address._notify_fields('create')
+        return address
+
     def delete(self):
         LOG.debug("Deleting IP address: %r" % self)
         if self._explicitly_allowed_on_interfaces():
             return self.update(marked_for_deallocation=False,
+                               allocated=False,
                                deallocated_at=None,
                                interface_id=None)
 
@@ -653,12 +723,14 @@ class IpAddress(ModelBase):
     def deallocate(self):
         LOG.debug("Marking IP address for deallocation: %r" % self)
         self.update(marked_for_deallocation=True,
+                    allocated=False,
                     deallocated_at=utils.utcnow(),
-                    interface_id=None)
+                    interface=None)
 
     def restore(self):
         LOG.debug("Restored IP address: %r" % self)
-        self.update(marked_for_deallocation=False, deallocated_at=None)
+        self.update(marked_for_deallocation=False, deallocated_at=None,
+                    allocated=True)
 
     def inside_globals(self, **kwargs):
         return db.db_query.find_inside_globals(
@@ -879,14 +951,19 @@ class Interface(ModelBase):
         return Interface(id=None, virtual_interface_id=None, device_id=None)
 
     def delete(self):
-        mac = MacAddress.get_by(interface_id=self.id)
-        if mac:
-            mac.delete()
+        mac_address, ips = db.db_api.delete_interface(self)
 
-        for ip in IpAddress.find_all_allocated_ips(interface_id=self.id):
-            ip.deallocate()
+        if mac_address:
+            if mac_address.mac_range:
+                plugin = mac.plugin()
+                generator = plugin.get_generator(mac_address.mac_range)
+                generator.mac_removed(mac_address.address)
+            # NOTE(jkoelker) notify that the mac was deleted
+            mac_address._notify_fields("delete")
 
-        super(Interface, self).delete()
+        for ip in ips:
+            # NOTE(jkoelker) notify that the ips were deallocated
+            ip._notify_fields("update")
 
     def data(self, **options):
         data = super(Interface, self).data()
@@ -1192,6 +1269,8 @@ def persisted_models():
             'MacAddressRange': MacAddressRange,
             'MacAddress': MacAddress,
             'Interface': Interface,
+            # NOTE(jkoelker) This is here so we can slowly move off the table
+            'AllocatableIp': AllocatableIp,
             }
 
 

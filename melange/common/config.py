@@ -76,7 +76,6 @@ def setup_logging(options, conf):
                get_option(conf, 'verbose', type='bool', default=False))
 
     root_logger = logging.getLogger('melange')
-    root_logger.propagate = 0
     if debug:
         root_logger.setLevel(logging.DEBUG)
     elif verbose:
